@@ -12,48 +12,17 @@
             "help": "data pin (F/T sensor)",
             "required": true
         },
-        "can-id": {
-            "help": "primary CAN node ID",
+        "serial-baudrate": {
+            "help": "serial port baudrate",
             "required": true
         },
-        "can-rd-pin": {
-            "help": "primary CAN RD pin",
+        "serial-buffer-in-size": {
+            "help": "serial RX buffer size (bytes)",
             "required": true
         },
-        "can-td-pin": {
-            "help": "primary CAN TD pin",
+        "serial-buffer-out-size": {
+            "help": "serial TX buffer size (bytes)",
             "required": true
-        },
-        "can-baudrate": {
-            "help": "primary CAN baudrate",
-            "required": true
-        },
-        "can-use-gripper": {
-            "help": "accept gripper commands on primary CAN channel"
-        },
-        "gripper-pwm-pin": {
-            "help": "PWM pin (gripper, if enabled)"
-        },
-        "gripper-fwd-pin": {
-            "help": "FWD pin (gripper, if enabled)"
-        },
-        "gripper-rev-pin": {
-            "help": "REV pin (gripper, if enabled)"
-        },
-        "can2-enable": {
-            "help": "enable secondary CAN channel (gripper only)"
-        },
-        "can2-id": {
-            "help": "secondary CAN node ID (gripper only)"
-        },
-        "can2-rd-pin": {
-            "help": "secondary CAN RD pin (gripper only)"
-        },
-        "can2-td-pin": {
-            "help": "secondary CAN TD pin (gripper only)"
-        },
-        "can2-baudrate": {
-            "help": "secondary CAN baudrate (gripper only)"
         }
     },
     "target_overrides": {
@@ -66,11 +35,9 @@
             "app.jr3-port": "Port0",
             "app.jr3-clock-pin": "p9",
             "app.jr3-data-pin": "p10",
-            "app.can-id": 1,
-            "app.can-rd-pin": "p30",
-            "app.can-td-pin": "p29",
-            "app.can-baudrate": 1000000,
-            "app.can-use-gripper": false
+            "app.serial-baudrate": 115200,
+            "app.serial-buffer-in-size": 32,
+            "app.serial-buffer-out-size": 16
         }
     }
 }

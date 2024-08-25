@@ -1,33 +1,30 @@
 #include "mbed.h"
-#include "atomic"
-
 #include "Jr3.hpp"
 #include "Jr3Controller.hpp"
 
-#if MBED_CONF_APP_CAN_USE_GRIPPER || MBED_CONF_APP_CAN2_ENABLE
-# include "Motor.h"
-#endif
+constexpr auto OFFSET = 4;
 
 enum can_ops : uint16_t
 {
-    JR3_SYNC           = 0x080,
-    JR3_ACK            = 0x100,
-    JR3_START_SYNC     = 0x180,
-    JR3_START_ASYNC    = 0x200,
-    JR3_STOP           = 0x280,
-    JR3_ZERO_OFFS      = 0x300,
-    JR3_SET_FILTER     = 0x380,
-    JR3_GET_STATE      = 0x400,
-    JR3_GET_FS_FORCES  = 0x480,
-    JR3_GET_FS_MOMENTS = 0x500,
-    JR3_RESET          = 0x580,
-    JR3_FORCES         = 0x600,
-    JR3_MOMENTS        = 0x680,
-    JR3_BOOTUP         = 0x700,
-#if MBED_CONF_APP_CAN_USE_GRIPPER || MBED_CONF_APP_CAN2_ENABLE
-    GRIPPER_PWM        = 0x780
-#endif
+    JR3_ACK = 1,
+    JR3_START,
+    JR3_STOP,
+    JR3_ZERO_OFFS,
+    JR3_SET_FILTER,
+    JR3_GET_STATE,
+    JR3_GET_FS,
+    JR3_RESET,
+    JR3_READ, // forces & moments
+    JR3_BOOTUP
 };
+
+// uint16_t Fx = 10000 ;
+// uint16_t Fy = 20000 ;
+// uint16_t Fz = 30000 ;
+// uint16_t Mx = 40000 ;
+// uint16_t My = 50000 ;
+// uint16_t Mz = 60000 ; 
+// //float F = 10.50 ;
 
 enum jr3_state : uint8_t
 {
@@ -35,9 +32,16 @@ enum jr3_state : uint8_t
     JR3_NOT_INITIALIZED = 0x01
 };
 
-uint16_t parseCutOffFrequency(const mbed::CANMessage & msg, size_t offset = 0)
+struct serial_msg
 {
-    if (msg.len >= sizeof(uint16_t) + offset)
+    uint16_t op;
+    uint8_t data[14]; // make room for 6*2 bytes (6 uint16_t channels) + 2 bytes (frame counter)
+    int size;
+};
+
+uint16_t parseCutOffFrequency(const serial_msg & msg, size_t offset = 0)
+{
+    if (msg.size >= sizeof(uint16_t) + offset)
     {
         uint16_t temp;
         memcpy(&temp, msg.data + offset, sizeof(uint16_t));
@@ -49,9 +53,9 @@ uint16_t parseCutOffFrequency(const mbed::CANMessage & msg, size_t offset = 0)
     }
 }
 
-uint32_t parseAsyncPeriod(const mbed::CANMessage & msg, size_t offset = 0)
+uint32_t parseAsyncPeriod(const serial_msg & msg, size_t offset = 0)
 {
-    if (msg.len >= sizeof(uint32_t) + offset)
+    if (msg.size >= sizeof(uint32_t) + offset)
     {
         uint32_t temp;
         memcpy(&temp, msg.data + offset, sizeof(uint32_t));
@@ -63,202 +67,193 @@ uint32_t parseAsyncPeriod(const mbed::CANMessage & msg, size_t offset = 0)
     }
 }
 
-#if MBED_CONF_APP_CAN_USE_GRIPPER || MBED_CONF_APP_CAN2_ENABLE
-void processGripperCommand(const mbed::CANMessage & msg, Motor & motor)
+void readMessage(const char * buffer, serial_msg & msg)
 {
-    if (msg.len == sizeof(float))
-    {
-        float pwm;
-        memcpy(&pwm, msg.data, sizeof(float));
-        printf("received gripper PWM value: %f\n", pwm);
+    msg.size = 0;
 
-        if (pwm >= -100.0f && pwm <= 100.0f)
+    char c = '0';
+    int index = 0;
+
+    bool has_op1 = false;
+    bool has_op2 = false;
+
+    while (c != '>')
+    {
+        c = buffer[index++];
+
+        if (c == '<' || c == '>')
         {
-            motor.speed(pwm / 100.0f);
+            continue;
+        }
+
+        if (!has_op1)
+        {
+            msg.op = int(c - '0') * 10;
+            has_op1 = true;
+        }
+        else if (!has_op2)
+        {
+            msg.op += int(c - '0');
+            has_op2 = true;
+        }
+        else
+        {
+            memcpy(msg.data + msg.size, &c, 1);
+            msg.size++;
         }
     }
 }
-#endif
 
-void sendData(mbed::CAN & can, mbed::CANMessage & msg_forces, mbed::CANMessage & msg_moments, uint16_t * data)
+int buildMessage(const serial_msg & msg, char * buffer)
 {
-    memcpy(msg_forces.data, data, 6); // fx, fy, fz
-    memcpy(msg_forces.data + 6, data + 6, sizeof(uint16_t)); // frame_counter
-    can.write(msg_forces);
+    sprintf(buffer, "<%02d", msg.op);
 
-    // there is no need to put a delay between these two writes since the NXP has a triple transmit buffer
-
-    memcpy(msg_moments.data, data + 3, 6); // mx, my, mz
-    memcpy(msg_moments.data + 6, data + 6, sizeof(uint16_t)); // frame_counter
-    can.write(msg_moments);
+    if (msg.size > 0)
+    {
+        memcpy(buffer + 3, msg.data, msg.size);
+    }
+    sprintf(buffer + 3 + msg.size, ">");
+    return msg.size + OFFSET;
 }
 
-void sendFullScales(mbed::CAN & can, mbed::CANMessage & msg, const Jr3Controller & controller, uint16_t * data)
+void sendData(mbed::BufferedSerial & serial, char * buffer, uint16_t * data)
 {
-    msg.data[0] = controller.getState() == Jr3Controller::READY ? JR3_READY : JR3_NOT_INITIALIZED;
-    memcpy(msg.data + 1, data, 6); // fsx, fsy, fsz OR msx, msy, msz
-    can.write(msg);
+    memcpy(buffer, data, 12);
+    memcpy(buffer + 12, data + 12, sizeof(uint16_t)); // frame_counter
+    serial.write(buffer, 14);
 }
 
-void sendAcknowledge(mbed::CAN & can, mbed::CANMessage & msg, const Jr3Controller & controller)
+void sendMessage(mbed::BufferedSerial & serial, const serial_msg & msg, char * buffer)
 {
-    msg.data[0] = controller.getState() == Jr3Controller::READY ? JR3_READY : JR3_NOT_INITIALIZED;
-    can.write(msg);
+    int size = buildMessage(msg, buffer);
+    serial.write(buffer, size);
+
+}
+
+
+void sendFullScales(mbed::BufferedSerial & serial, char * buffer, const Jr3Controller & controller, uint16_t * data)
+{
+    uint8_t state = controller.getState() == Jr3Controller::READY ? JR3_READY : JR3_NOT_INITIALIZED;
+    // state = JR3_NOT_INITIALIZED;
+    serial_msg msg {JR3_ACK, {state}, 13}; 
+    memcpy(msg.data + 1, data, 12); // fsx, fsy, fsz, msx, msy, msz [uint16_t]
+    sendMessage(serial, msg, buffer);
+    printf("\n");
+}
+
+void sendAcknowledge(mbed::BufferedSerial & serial, char * buffer, const Jr3Controller & controller)
+{
+    uint8_t state = controller.getState() == Jr3Controller::READY ? JR3_READY : JR3_NOT_INITIALIZED;
+    serial_msg msg {JR3_ACK, {state}, 1};
+    sendMessage(serial, msg, buffer);
 }
 
 int main()
 {
-    rtos::ThisThread::sleep_for(2s);
+    int i = 0;
 
-    printf("booting\n");
+    while (i < 5)
+    {
+        rtos::ThisThread::sleep_for(1s);
+        i++;
+    }
+    i=0;
+    mbed::BufferedSerial serial(USBTX, USBRX);
+    serial.set_baud(MBED_CONF_APP_SERIAL_BAUDRATE);
+    // serial.set_format(8, mbed::BufferedSerial::None, 1); // default
+        printf("\n"); 
+        printf("booting primero\n");
 
-    mbed::RawCAN can(MBED_CONF_APP_CAN_RD_PIN, MBED_CONF_APP_CAN_TD_PIN);
-    can.frequency(MBED_CONF_APP_CAN_BAUDRATE);
-    can.reset();
+    while (i < 5)
+    {
+        rtos::ThisThread::sleep_for(1s);
+        printf("\n"); 
+        printf("booting %d\n", i);
+        i++;
+    }
 
-#if MBED_CONF_APP_CAN2_ENABLE
-    mbed::CAN can2(MBED_CONF_APP_CAN2_RD_PIN, MBED_CONF_APP_CAN2_TD_PIN);
-    can2.frequency(MBED_CONF_APP_CAN2_BAUDRATE);
-    can2.reset();
-#endif
-
-    mbed::CANMessage msg_in;
-    mbed::CANMessage msg_out_bootup, msg_out_ack, msg_out_ack_long, msg_out_forces, msg_out_moments;
-
-    msg_out_bootup.len = 0;
-    msg_out_bootup.id = JR3_BOOTUP + MBED_CONF_APP_CAN_ID;
-
-    msg_out_ack.len = 1; // state
-    msg_out_ack_long.len = 7; // state (1) + full scales (6)
-    msg_out_ack.id = msg_out_ack_long.id = JR3_ACK + MBED_CONF_APP_CAN_ID;
-
-    msg_out_forces.len = msg_out_moments.len = 8; // FT data (6) + frame counter (2)
-    msg_out_forces.id = JR3_FORCES + MBED_CONF_APP_CAN_ID;
-    msg_out_moments.id = JR3_MOMENTS + MBED_CONF_APP_CAN_ID;
+    char buffer_in[MBED_CONF_APP_SERIAL_BUFFER_IN_SIZE] = {0};
+    char buffer_out[MBED_CONF_APP_SERIAL_BUFFER_OUT_SIZE] = {0};
+    // COMO NO VAMOS A TENER CONECTADO EL JR3 TODO LO QUE TENGA RELACIÓN CON LA RECOGIDA/ENVIO DE DATOS DEL JR3 SE TENDRA QUE COMENTAR
 
     using Jr3Reader = Jr3<MBED_CONF_APP_JR3_PORT, MBED_CONF_APP_JR3_CLOCK_PIN, MBED_CONF_APP_JR3_DATA_PIN>;
     Jr3Reader jr3;
     Jr3Controller controller({&jr3, &Jr3Reader::readFrame});
+   
 
-#if MBED_CONF_APP_CAN_USE_GRIPPER || MBED_CONF_APP_CAN2_ENABLE
-    Motor motor(MBED_CONF_APP_GRIPPER_PWM_PIN, MBED_CONF_APP_GRIPPER_FWD_PIN, MBED_CONF_APP_GRIPPER_REV_PIN);
-#endif
-
-    mbed::CircularBuffer<mbed::CANMessage, 32> queue;
-    std::atomic_bool syncReceived {false};
-
-    can.attach([&can, &syncReceived, &queue] {
-        mbed::CANMessage msg;
-
-        if (can.read(msg))
-        {
-            if (msg.id == JR3_SYNC)
-            {
-                syncReceived = true;
-            }
-            else if ((msg.id & 0x07F) == MBED_CONF_APP_CAN_ID)
-            {
-                queue.push(msg);
-            }
-        }
-    });
-
-    if (jr3.isConnected())
+    if (jr3.isConnected()) // Para simular que esta conectado vamos a decir que jr3 esta conectado asi que devuleve un 1 jr3.isConected()
     {
         printf("JR3 sensor is connected\n");
-        controller.initialize(); // this blocks until the initialization is completed
-        can.write(msg_out_bootup);
+        controller.initialize(); // this blocks until the initialization is completed --> Realmente en la simulación no inicializamos el JR3
+        sendMessage(serial, {JR3_BOOTUP, {}, 0}, buffer_out);
     }
     else
     {
         printf("JR3 sensor is not connected\n");
     }
 
-    uint16_t data[7]; // helper buffer for misc FT data (includes room for a frame counter)
+    uint16_t fs_data[6];// helper buffer for full scales (6*2)
+    //memcpy(&fs_data[0], &F, sizeof(F)); // float tiene 4 bytes no dos como hemos puesto para Fx
+    int size;
 
-    while (true)
+    serial_msg msg_in;
+    serial_msg msg_data {JR3_READ, {}, 14};
+
+
+    while ((size = serial.read(buffer_in, MBED_CONF_APP_SERIAL_BUFFER_IN_SIZE)) > 0)
     {
-        if (syncReceived)
+        // printf("ADENTRO DEL WHILE");  
+        readMessage(buffer_in, msg_in);
+        // printf("El readmessage ha leido un msg_in.op: %d\n", msg_in.op);
+        switch (msg_in.op)
         {
-            if (controller.acquire(data))
+        // printf("ADENTRO DEL SWITCH");  
+        case JR3_START:
+            printf("received JR3 start command (asynchronous)\n");
+            controller.startAsync([&serial, &msg_data, &buffer_out](uint16_t * data)
             {
-                sendData(can, msg_out_forces, msg_out_moments, data);
-            }
-
-            syncReceived = false;
+                memcpy(msg_data.data, data, sizeof(msg_data.data));
+                sendMessage(serial, msg_data, buffer_out);
+            }, parseCutOffFrequency(msg_in), parseAsyncPeriod(msg_in, sizeof(uint16_t)));
+            sendAcknowledge(serial, buffer_out, controller);
+            break;
+        case JR3_STOP:
+            printf("received JR3 stop command\n");
+            controller.stop();
+            sendAcknowledge(serial, buffer_out, controller);
+            break;
+        case JR3_ZERO_OFFS:
+            printf("received JR3 zero offsets command\n");
+            controller.calibrate();
+            sendAcknowledge(serial, buffer_out, controller);
+            break;
+        case JR3_SET_FILTER:
+            printf("received JR3 set filter command\n");
+            controller.setFilter(parseCutOffFrequency(msg_in));
+            sendAcknowledge(serial, buffer_out, controller);
+            break;
+        case JR3_GET_STATE:
+            printf("received JR3 get state command\n");
+            sendAcknowledge(serial, buffer_out, controller);
+            break;
+        case JR3_GET_FS:
+            printf("received JR3 get full scales (forces) command\n");
+            controller.getFullScales(fs_data); 
+            // VAMOS A INVENTARNOS LOS VALORES DE fs_data
+            sendFullScales(serial, buffer_out, controller , fs_data);
+            break;
+        case JR3_RESET:
+            printf("received JR3 reset command\n");
+            controller.initialize();
+            sendAcknowledge(serial, buffer_out, controller);
+            break;
+        default:
+            printf("unsupported command: %d\n", msg_in.op);
+            break;
         }
-
-        while (queue.pop(msg_in))
-        {
-            switch (msg_in.id & 0x0780)
-            {
-            case JR3_START_SYNC:
-                printf("received JR3 start command (synchronous)\n");
-                controller.startSync(parseCutOffFrequency(msg_in));
-                sendAcknowledge(can, msg_out_ack, controller);
-                break;
-            case JR3_START_ASYNC:
-                printf("received JR3 start command (asynchronous)\n");
-                controller.startAsync([&can, &msg_out_forces, &msg_out_moments](uint16_t * data)
-                {
-                    sendData(can, msg_out_forces, msg_out_moments, data);
-                }, parseCutOffFrequency(msg_in), parseAsyncPeriod(msg_in, sizeof(uint16_t)));
-                sendAcknowledge(can, msg_out_ack, controller);
-                break;
-            case JR3_STOP:
-                printf("received JR3 stop command\n");
-                controller.stop();
-                sendAcknowledge(can, msg_out_ack, controller);
-                break;
-            case JR3_ZERO_OFFS:
-                printf("received JR3 zero offsets command\n");
-                controller.calibrate();
-                sendAcknowledge(can, msg_out_ack, controller);
-                break;
-            case JR3_SET_FILTER:
-                printf("received JR3 set filter command\n");
-                controller.setFilter(parseCutOffFrequency(msg_in));
-                sendAcknowledge(can, msg_out_ack, controller);
-                break;
-            case JR3_GET_STATE:
-                printf("received JR3 get state command\n");
-                sendAcknowledge(can, msg_out_ack, controller);
-                break;
-            case JR3_GET_FS_FORCES:
-                printf("received JR3 get full scales (forces) command\n");
-                controller.getFullScales(data);
-                sendFullScales(can, msg_out_ack_long, controller, data);
-                break;
-            case JR3_GET_FS_MOMENTS:
-                printf("received JR3 get full scales (moments) command\n");
-                controller.getFullScales(data);
-                sendFullScales(can, msg_out_ack_long, controller, data + 3);
-                break;
-            case JR3_RESET:
-                printf("received JR3 reset command\n");
-                controller.initialize();
-                sendAcknowledge(can, msg_out_ack, controller);
-                break;
-#if MBED_CONF_APP_CAN_USE_GRIPPER
-            case GRIPPER_PWM:
-                processGripperCommand(msg_in, motor);
-                break;
-#endif
-            default:
-                printf("unsupported command: 0x%03x\n", msg_in.id & 0x0780);
-                break;
-            }
-        }
-
-#if MBED_CONF_APP_CAN2_ENABLE
-        if (can2.read(msg_in) && msg_in.id == GRIPPER_PWM + MBED_CONF_APP_CAN2_ID)
-        {
-            processGripperCommand(msg_in, motor);
-        }
-#endif
-
+        //  printf("FUERA DEL SWITCH");  
         // this is the minimum amount of time that actually sleeps the thread, use AccurateWaiter
         // for the microsecond scale; wait_us(), on the contrary, spins the CPU
-        rtos::ThisThread::sleep_for(1ms);
+        rtos::ThisThread::sleep_for(1s);
     }
 }
