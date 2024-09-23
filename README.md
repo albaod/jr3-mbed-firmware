@@ -1,96 +1,131 @@
-# JR3 Mbed firmware
+# BufferedSerial Communication Protocol
 
-An Arm Mbed OS 6 application that performs data acquisition from a JR3 force-torque sensor and streams it through a CAN channel.
+An application that implements a communication protocol over UART using the BufferedSerial class. The protocol defines the message structure for data transmission between a transmitter and a receiver in a serial communication system.
 
-Incidentally, support was added for sending simple PWM commands to a Lacquey fetch gripper through a secondary optional CAN channel.
+## Communication Protocol
 
-## Installation
+The communication protocol for this project is based on the UART structure, organized in frames. Each frame represents a message that follows a predefined structure.
 
-Since the Mbed Online Compiler has been discontinued, development and compilation should be carried out at <https://studio.keil.arm.com/>. Make sure you select "mbed LPC1768" as the compilation target. Once built, plug in the Mbed to a USB port of your PC and drag-and-drop the downloaded .bin file into it.
+### Frame Structure
 
-## CAN protocol
+Each message in this protocol follows the structure below:
 
-| command                          | op code | direction | payload<br>(bytes) | details                                                                                              |
-|----------------------------------|:-------:|:---------:|:------------------:|------------------------------------------------------------------------------------------------------|
-| sync                             |  0x080  |     in    |          0         |                                                                                                      |
-| acknowledge                      |  0x100  |    out    |        1-7         | LSB byte: 0x00 - sensor ready; 0x01 - not initialized<br>6 MSB bytes (optional): see command details |
-| **start sync**                   |  0x180  |     in    |          2         | low-pass filter cutoff frequency in 0.01*Hz (integer)<br>(e.g. 1025 = 10.25 Hz)                      |
-| **start async**                  |  0x200  |     in    |          6         | 2 LSB bytes: cutoff frequency (as above)<br>4 MSB bytes: period in us (integer)                      |
-| **stop**                         |  0x280  |     in    |          0         |                                                                                                      |
-| **zero offsets**                 |  0x300  |     in    |          0         |                                                                                                      |
-| **set filter**                   |  0x380  |     in    |          2         | cutoff frequency (as above)                                                                          |
-| **get state**                    |  0x400  |     in    |          0         |                                                                                                      |
-| **get full scales**<br>(forces)  |  0x480  |     in    |          0         | acknowledge message carries force full scales<br>in the 6 MSB bytes (Fx, Fy, Fz)                     |
-| **get full scales**<br>(moments) |  0x500  |     in    |          0         | acknowledge message carries moment full scales<br>in the 6 MSB bytes (Mx, My, Mz)                    |
-| **reset**                        |  0x580  |     in    |          0         |                                                                                                      |
-| force data                       |  0x600  |    out    |          8         | (3x) 2 LSB bytes: Fx, Fy, Fz (integer, signed)<br>2 MSB bytes: frame counter                         |
-| moment data                      |  0x680  |    out    |          8         | (3x) 2 LSB bytes: Mx, My, Mz (integer, signed)<br>2 MSB bytes: frame counter                         |
-| bootup                           |  0x700  |    out    |          0         |                                                                                                      |
-| gripper PWM                      |  0x780  |     in    |          4         | PWM command between -100.0 and 100.0 (float)                                                         |
+1. **Start Character ('<')**: Marks the beginning of a new message.
+2. **Operation Field ('OP')**: Specifies the task or command being executed. There are 10 possible operations. To maintain consistency, each command is represented by two bytes, with a leading '0' for single-digit commands.
+3. **Data Field ('DATA')**: Contains the specific data required for each command. This field has a capacity of 14 bytes, but not all commands use the full capacity. Some commands do not require additional data, leaving this field empty.
+4. **End Character ('>')**: Marks the end of the message. The receiver stops reading the message when it encounters this character.
 
-Bolded incoming commands imply that the Mbed will respond with an acknowledge message.
+### Example Frame Structure
 
-## Usage
+Here is an example of the message structure in the protocol:
 
-On bootup, the calibration matrix and full scales are queried from the sensor and stored for later use. If successful, the bootup message is sent. This may take a few seconds from initial power up. A failure means that there is no connection to the sensor. Re-initialization may be requested during normal operation through the "reset" command. If the initialization succeeds, the JR3 controller is in "ready" state, otherwise it remains in "not initialized" state. All acknowledge messages carry this state information in their payload. The "get state" command is a no-op that can be used to ping the controller.
+| Field               | Description                                |
+|---------------------|--------------------------------------------|
+| **Start Character**  | `<` (Start of message)                     |
+| **Operation Field**  | Operation code indicating the task (2 bytes) |
+| **Data Field**       | Optional command-specific data (up to 14 bytes) |
+| **End Character**    | `>` (End of message)                       |
 
-The JR3 sensor operates in two modes: synchronous and asynchronous. Both entail that a background thread will be performing data acquisition, decoupling, offset removal and filtering at full sensor bandwidth (8 KHz per channel).
+### Message Table
 
-- Synchronous ("start sync" command): per the CiA 402 standard (a.k.a. CANopen), a SYNC message is broadcast over the CAN network by a producer node so that consumers act upon (e.g. send sensor data, accept motion commands). As soon as the incoming SYNC message is processed, the Mbed will send the latest force and moment data in return.
-- Asynchronous ("start async" command): an additional thread is spawned to query latest forces and moments at the specified fixed rate (tested at 1 ms).
+The following table outlines the different messages in the protocol:
 
-The sensor is **not** calibrated by default. Use the "zero offsets" command to capture the current offset and substract it from subsequent filtered results. This command can be issued at any time.
+| **Message Name**       | **Function**                             | **Op Code** | **Direction** | **Payload (Bytes)** | **Details** |
+|------------------------|------------------------------------------|-------------|---------------|---------------------|-------------|
+| `JR3_ACK`              | Acknowledge                              | `<01>`      | Outgoing      | 1-7                 | Status of sensor: \n 0x00 - Sensor ready \n 0x01 - Sensor not initialized |
+| **`JR3_START`**        | Start (Asynchronous)                     | `<02>`      | Incoming      | 6                   | 2 bytes for cutoff frequency, 4 bytes for acquisition loop period (in 0.01 Hz) |
+| **`JR3_STOP`**         | Stop                                     | `<03>`      | Incoming      | 0                   | -           |
+| **`JR3_ZERO_OFFS`**    | Zero offsets                             | `<04>`      | Incoming      | 0                   | -           |
+| **`JR3_SET_FILTER`**   | Set filter                               | `<05>`      | Incoming      | 2                   | Cutoff frequency |
+| **`JR3_GET_STATE`**    | Get state                                | `<06>`      | Incoming      | 0                   | -           |
+| **`JR3_GET_FS`**       | Get full scales (forces and moments)     | `<07>`      | Incoming      | 0                   | Acknowledge message contains force/moment range in 6 bytes (Fx, Fy, Fz, Mx, My, Mz) |
+| **`JR3_RESET`**        | Reset                                    | `<08>`      | Incoming      | 0                   | -           |
+| `JR3_READ`             | Read (force and moment data)             | `<09>`      | Outgoing      | 14                  | 6 bytes for forces/moments (Fx, Fy, Fz, Mx, My, Mz) and 2 bytes for frame counter |
+| `JR3_BOOTUP`           | Bootup                                   | `<10>`      | Outgoing      | 0                   | Indicates that the sensor has started up |
 
-It is highly recommended to enable raw data filtering by specifying the desired cutoff frequency to either start command. This firmware implements a simple first-order low-pass IIR filter, also known as an exponential moving average (see [Wikipedia article](https://w.wiki/7Er6)). Its cutoff frequency can be modified through the "set filter" command.
+*Messages in bold* automatically receive an acknowledgment (`JR3_ACK`) from the Mbed device.
 
-Outgoing force and moment data requires post-processing on the receiver's side. These signed integer values should be multiplied by the corresponding full scale and divided by a factor of 16384 (=2^14) for forces and 16384\*10 for moments. The resulting values will be expressed in Newtons and Newton*meters, respectively. Use the "get full scales" command to query the sensor full scales.
+### Message Descriptions
+
+Below is a brief explanation of the operation code (opcode) for each message:
+
+- **JR3_ACK**: Sent by the Mbed, informs the current state of the JR3 sensor:
+  - `JR3_READY (0x00)`: The JR3 sensor is correctly connected.
+  - `JR3_NOT_INITIALIZED (0x01)`: The JR3 sensor is not correctly connected or initialized.
+
+- **JR3_START**: Initiates the asynchronous mode and begins the data acquisition process. The message includes the cutoff frequency and acquisition period for configuring the sensor:
+  - Cutoff frequency: Specifies the frequency at which the sensor filter should attenuate signals.
+  - Acquisition period: Defines the interval between readings sent by the JR3 sensor.
+
+- **JR3_STOP**: Stops the force and moment data transmission.
+
+- **JR3_ZERO_OFFS**: Calibrates the sensor offsets.
+
+- **JR3_SET_FILTER**: Sets the cutoff frequency for the sensor filter.
+
+- **JR3_GET_STATE**: Requests the current state of the JR3 sensor.
+
+- **JR3_GET_FS**: Requests the constant force and moment data experienced by the sensor when no external forces are applied. The acknowledgment message includes this data in its payload.
+
+- **JR3_RESET**: Reinitializes the JR3 sensor.
+
+- **JR3_READ**: Sends the force and moment data registered by the JR3 sensor every specified acquisition period. The structure of the message is as follows:
+  - 6 bytes for the force and moment data (Fx, Fy, Fz, Mx, My, Mz)
+  - 2 bytes for the frame counter.
+
+- **JR3_BOOTUP**: Sent by the Mbed when the JR3 sensor has started up, indicating it is ready to receive commands.
+
+### Design Considerations
+
+This protocol design was inspired by the CAN protocol from Bartosz Piotr Lukawski. Unlike CAN, which divides force and moment data into two separate commands due to byte limitations, BufferedSerial has 14 bytes available, allowing both force and moment data to be sent in a single message. This design simplifies communication and ensures coherence between force and moment readings.
+
+The frame counter is retained from the CAN protocol and helps ensure consistency in force and moment readings. While not strictly necessary in BufferedSerial due to the larger byte capacity, the frame counter can still be useful for verifying communication integrity and performance analysis.
+
+Additionally, the command related to gripper control (PMW) was removed, as it is not relevant to this project. The synchronous mode was also eliminated since synchronization between multiple devices (as used in the TEO humanoid) is unnecessary here. This led to the unification of the `JR3_START` command into a single, streamlined version, improving overall performance and reducing unnecessary functions.
+
 
 ## Configuration
 
 See [mbed-app.json](mbed_app.json) for a list of configurable parameters and their description. The project should be recompiled after any changes to this file.
 
-## Additional tools
+## Additional Tools
 
-Most Linux kernels should support [SocketCAN](https://www.kernel.org/doc/html/next/networking/can.html). In order to create a network interface for a CAN channel with a baudrate of 1 Mbps, run the following command:
+### `abb_motion_program_exec` Library
+- Used for **Pose Target** mode (`EgmPoseTargetConfig`), sending position and orientation targets to the ABB robot.
 
-```
-sudo ip link set can0 up txqueuelen 1000 type can bitrate 1000000
-```
+### `abb_robot_client` Library
+- Only the **`egm`** module is used to control the robot's movements through the Externally Guided Motion (EGM) interface.
 
-To send a CAN message, install the [can-utils](https://github.com/linux-can/can-utils) package (`apt install can-utils`) and run:
+### KDL Library
+- Utilized the **Motion** module for trajectory planning, though it was partially re-implemented in Python due to incomplete `PyKDL`.
 
-```
-cansend can0 201#C80010270000
-```
+## Project Overview
 
-This will start an ASYNC publisher on ID 1 with a period of 10 ms (10000 us = 0x2710) and a cutoff frequency of 2 Hz (200 Hz*0.01 = 0x00C8). Use the `candump can0` command on a new terminal to inspect live traffic on the CAN bus, including any response from the Mbed.
+This project aims to integrate a JR3 force-torque sensor with an ABB robot to modify its tool's trajectory along the Z-axis when encountering an object. The goal is to control the ABB robot externally using the **Externally Guided Motion (EGM)** feature, which allows real-time path correction.
 
-A helper Python script is provided for visual inspection of filtered data, [can-plotter.py](can-plotter.py). Example usage:
+The project is motivated by the need to modify the trajectories of GoFa cobots in the Carlos III University lab using an external controller. The ABB RobotStudio simulator is used to verify this functionality with a connected JR3 sensor and an Mbed LPC1768 microcontroller.
 
-```
-candump can0 | python3 can-plotter.py --id 1
-```
+In this github you can access the python script (`main_fz.py`) used to communicate with the Mbed, using libraries `JR3Manager.py` (for sensor data) and `motion_3.py` (based on KDL), which are also available in this github. 
 
 ## Citation
 
 If you found this project useful, please consider citing the following work:
 
-Łukawski, B., Rodríguez-Sanz, A., Victores, J., & Balaguer, C. (2024). An open-source implementation of a force-torque sensor data acquisition device for the humanoid robot TEO. In Actas del Simposio de Robótica, Bioingeniería y Visión por Computador (pp. 79–84). Universidad de Extremadura.
+Olano Díaz, Alba (2024). Integración de un sensor fuerza-par en un robot industrial ABB. Universidad Carlos III de Madrid.
+
 
 ```bibtex
-@inproceedings{lukawski2024srbv,
-    author={{\L}ukawski, Bartek and Rodríguez-Sanz, Alberto and Victores, Juan G. and Balaguer, Carlos},
-    title={{An open-source implementation of a force-torque sensor data acquisition device for the humanoid robot TEO}},
-    booktitle={Actas del Simposio de Robótica, Bioingeniería y Visión por Computador},
+@inproceedings{
+    author={Olano Díaz, Alba},
+    title={{Integración de un sensor fuerza-par en un robot industrial ABB. Universidad Carlos III de Madrid.}},
     year={2024},
-    pages={79--84},
-    publisher={Universidad de Extremadura},
-    url={http://hdl.handle.net/10662/21260},
+    publisher={Universidad Carlos III de Madrid},
 }
 ```
 
 ## See also
 
+-Łukawski, B., Rodríguez-Sanz, A., Victores, J., & Balaguer, C. (2024). An open-source implementation of a force-torque sensor data acquisition device for the humanoid robot TEO. In Actas del Simposio de Robótica, Bioingeniería y Visión por Computador (pp. 79–84). Universidad de Extremadura.
 - Alberto López Esteban, *Diseño y desarrollo de un módulo de conexión a CANopen de un sensor comercial fuerza/par*, bachelor's thesis, Universidad Carlos III de Madrid, 2011
 - Carlos de la Hoz Najarro, *Puesta en marcha del sensor fuerza/par JR3*, bachelor's thesis, Universidad Carlos III de Madrid, 2011
 - Javier Berrocal, *Design and implementation of a data acquisition system for force/torque sensors*, master's thesis, Universidad Carlos III de Madrid, 2019
